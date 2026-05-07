@@ -35,12 +35,18 @@ def _load_data(path: str, well_col: str = "well_id") -> pd.DataFrame:
     """Load a CSV or a directory of CSVs, returning one concatenated DataFrame.
 
     When reading a directory each file is assumed to be one well.
+    Prefers *__horizontal_well.csv files (Rogii competition naming) so that
+    typewell CSV files in the same folder are never accidentally loaded.
+    Falls back to all *.csv files only when no horizontal-well files are found.
     If the resulting DataFrame has no well_id column the filename stem is
     injected as well_id so the rest of the pipeline always has a well identifier.
     """
     p = Path(path)
     if p.is_dir():
-        csv_files = sorted(p.glob("*.csv"))
+        # Prefer competition-standard horizontal well naming
+        csv_files = sorted(p.glob("*__horizontal_well.csv"))
+        if not csv_files:
+            csv_files = sorted(p.glob("*.csv"))
         if not csv_files:
             raise FileNotFoundError(f"No CSV files found in directory: {path}")
         console.print(f"  Reading {len(csv_files)} CSV files from {path}")
