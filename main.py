@@ -85,10 +85,17 @@ def scrape(lat, lon, age, output):
 @cli.command()
 @click.option("--data",       required=True, type=str, help="Path to training CSV")
 @click.option("--prior-json", default=None,  type=str, help="Path to geo prior JSON (from scrape)")
-@click.option("--model",      default="catboost", type=click.Choice(["catboost", "transformer"]))
-def train(data, prior_json, model):
+@click.option("--strategy",   default="catboost", type=click.Choice(["catboost", "clustered", "transformer"]))
+@click.option("--cv-folds",   default=0, type=int, help="Run repeated well-level validation splits")
+@click.option("--n-clusters", default=5, type=int, help="Number of well clusters for clustered training")
+def train(data, prior_json, strategy, cv_folds, n_clusters):
     """Train TVT prediction model on competition data."""
-    from model.trainer import train_baseline
+    from model.trainer import (
+        train_baseline,
+        cross_validate_baseline,
+        train_clustered_baseline,
+        train_transformer_model,
+    )
 
     geo_priors = None
     if prior_json and os.path.exists(prior_json):
@@ -97,20 +104,41 @@ def train(data, prior_json, model):
         console.print(f"[cyan]Loaded geological priors from {prior_json}[/]")
 
     console.print(Panel(
-        f"[bold]Training {model.upper()} model[/]\n"
+        f"[bold]Training {strategy.replace('_', ' ').upper()} model[/]\n"
         f"Data: {data}\n"
         f"Geological priors: {'YES' if geo_priors else 'NO (use --prior-json to add)'}",
         title="GeoTVT Trainer"
     ))
 
-    if model == "catboost":
+    if cv_folds > 0:
+        cv_results = cross_validate_baseline(data, geo_priors=geo_priors, n_splits=cv_folds)
+        console.print(f"\n[bold green]Cross-validation complete![/]")
+        console.print(f"  Mean MAE:  [cyan]{cv_results['mean_mae']:.4f}[/]")
+        console.print(f"  Std MAE:   [cyan]{cv_results['std_mae']:.4f}[/]")
+        console.print(f"  Mean RMSE: [cyan]{cv_results['mean_rmse']:.4f}[/]")
+        return
+
+    if strategy == "catboost":
         metrics = train_baseline(data, geo_priors=geo_priors)
         console.print(f"\n[bold green]Training complete![/]")
         console.print(f"  Val MAE:  [cyan]{metrics['mae']:.4f}[/]")
         console.print(f"  Val RMSE: [cyan]{metrics['rmse']:.4f}[/]")
         console.print(f"  Features: [cyan]{metrics['n_features']}[/]")
+    elif strategy == "clustered":
+        metrics = train_clustered_baseline(data, geo_priors=geo_priors, n_clusters=n_clusters)
+        console.print(f"\n[bold green]Clustered training complete![/]")
+        console.print(f"  Val MAE:  [cyan]{metrics['mae']:.4f}[/]")
+        console.print(f"  Val RMSE: [cyan]{metrics['rmse']:.4f}[/]")
+        console.print(f"  Clusters: [cyan]{metrics['n_clusters']}[/]")
+        console.print(f"  Features: [cyan]{metrics['n_features']}[/]")
+    elif strategy == "transformer":
+        metrics = train_transformer_model(data, geo_priors=geo_priors)
+        console.print(f"\n[bold green]Transformer training complete![/]")
+        console.print(f"  Val MAE:  [cyan]{metrics['mae']:.4f}[/]")
+        console.print(f"  Val RMSE: [cyan]{metrics['rmse']:.4f}[/]")
+        console.print(f"  Model: [cyan]{metrics['model_path']}[/]")
     else:
-        console.print("[yellow]Transformer training not yet wired to CLI — use model/trainer.py directly[/]")
+        console.print("[red]Unknown training strategy. Use catboost, clustered, or transformer.[/]")
 
 
 # ─── predict ─────────────────────────────────────────────────────────────────

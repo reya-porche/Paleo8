@@ -9,61 +9,73 @@ This encoder gives the TVT predictor access to that geological context.
 """
 
 import numpy as np
-import torch
-import torch.nn as nn
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:
+    torch = None
+    nn = None
 from typing import Optional
 
 
-class TypewellEncoder(nn.Module):
-    """
-    1D CNN + self-attention encoder for typewell GR logs.
-    
-    Input:  [batch, seq_len, n_features]   (GR + formation encoding)
-    Output: [batch, embed_dim]             (geological context vector)
-    
-    Architecture:
-      Conv1d(filters) → LayerNorm → Self-Attention → Global Pool → Linear
-    """
+if nn is None:
+    class TypewellEncoder:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("PyTorch is required for TypewellEncoder")
 
-    def __init__(
-        self,
-        n_input_features: int = 4,  # GR, depth_norm, formation_enc, lith_enc
-        embed_dim: int = 64,
-        n_filters: int = 128,
-        kernel_size: int = 7,
-        n_heads: int = 4,
-    ):
-        super().__init__()
+        def forward(self, *args, **kwargs):
+            raise ImportError("PyTorch is required for TypewellEncoder")
+else:
+    class TypewellEncoder(nn.Module):
+        """
+        1D CNN + self-attention encoder for typewell GR logs.
+        
+        Input:  [batch, seq_len, n_features]   (GR + formation encoding)
+        Output: [batch, embed_dim]             (geological context vector)
+        
+        Architecture:
+          Conv1d(filters) → LayerNorm → Self-Attention → Global Pool → Linear
+        """
 
-        self.conv1 = nn.Conv1d(n_input_features, n_filters, kernel_size, padding=kernel_size // 2)
-        self.conv2 = nn.Conv1d(n_filters, n_filters, 5, padding=2)
-        self.norm1 = nn.LayerNorm(n_filters)
-        self.norm2 = nn.LayerNorm(n_filters)
+        def __init__(
+            self,
+            n_input_features: int = 4,  # GR, depth_norm, formation_enc, lith_enc
+            embed_dim: int = 64,
+            n_filters: int = 128,
+            kernel_size: int = 7,
+            n_heads: int = 4,
+        ):
+            super().__init__()
 
-        self.attention = nn.MultiheadAttention(
-            embed_dim=n_filters, num_heads=n_heads, batch_first=True
-        )
-        self.pool = nn.AdaptiveAvgPool1d(1)
+            self.conv1 = nn.Conv1d(n_input_features, n_filters, kernel_size, padding=kernel_size // 2)
+            self.conv2 = nn.Conv1d(n_filters, n_filters, 5, padding=2)
+            self.norm1 = nn.LayerNorm(n_filters)
+            self.norm2 = nn.LayerNorm(n_filters)
 
-        self.project = nn.Sequential(
-            nn.Linear(n_filters, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
+            self.attention = nn.MultiheadAttention(
+                embed_dim=n_filters, num_heads=n_heads, batch_first=True
+            )
+            self.pool = nn.AdaptiveAvgPool1d(1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch, seq, features] → [batch, features, seq]
-        x = x.permute(0, 2, 1)
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        # → [batch, seq, filters]
-        x = x.permute(0, 2, 1)
-        x = self.norm1(x)
-        x_attn, _ = self.attention(x, x, x)
-        x = self.norm2(x + x_attn)
-        # Global pool → [batch, filters, 1] → [batch, filters]
-        x = self.pool(x.permute(0, 2, 1)).squeeze(-1)
-        return self.project(x)
+            self.project = nn.Sequential(
+                nn.Linear(n_filters, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # x: [batch, seq, features] → [batch, features, seq]
+            x = x.permute(0, 2, 1)
+            x = torch.relu(self.conv1(x))
+            x = torch.relu(self.conv2(x))
+            # → [batch, seq, filters]
+            x = x.permute(0, 2, 1)
+            x = self.norm1(x)
+            x_attn, _ = self.attention(x, x, x)
+            x = self.norm2(x + x_attn)
+            # Global pool → [batch, filters, 1] → [batch, filters]
+            x = self.pool(x.permute(0, 2, 1)).squeeze(-1)
+            return self.project(x)
 
 
 def encode_typewell_df(df, gr_col="GR", depth_col="MD",

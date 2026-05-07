@@ -35,13 +35,17 @@ CACHE_TTL_DAYS    = 30          # re-fetch after this many days
 SEQUENCE_WINDOW   = 50          # MD steps to look back
 PREDICTION_STEPS  = 10          # how many steps ahead to predict
 CATBOOST_PARAMS = {
-    "iterations":       1000,
-    "learning_rate":    0.05,
-    "depth":            8,
-    "loss_function":    "RMSE",
-    "eval_metric":      "RMSE",
-    "random_seed":      42,
-    "verbose":          100,
+    "iterations":         2000,
+    "learning_rate":      0.03,
+    "depth":              9,
+    "loss_function":      "MAE",
+    "eval_metric":        "MAE",
+    "random_seed":        42,
+    "verbose":            100,
+    "l2_leaf_reg":        5,
+    "bagging_temperature":0.2,
+    "random_strength":    1.0,
+    "bootstrap_type":     "Bayesian",
 }
 
 # ─── Geological Ontology ──────────────────────────────────────────────────────

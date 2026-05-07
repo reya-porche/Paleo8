@@ -14,11 +14,16 @@ Stage 2 — Geological-Aware Transformer
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
 from pathlib import Path
 from typing import Optional, Tuple
 import sys
+
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:
+    torch = None
+    nn = None
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import SEQUENCE_WINDOW, CATBOOST_PARAMS, MODEL_DIR
@@ -66,13 +71,101 @@ def engineer_sequence_features(df: pd.DataFrame,
         feat["horiz_dist"] = np.sqrt(feat["X"]**2 + feat["Y"]**2)
         feat["inclination_proxy"] = feat["Z"].diff().abs().rolling(5, min_periods=1).mean()
 
+    # Position within well
+    if "well_id" in feat.columns and "MD" in feat.columns:
+        md_min = feat.groupby("well_id")["MD"].transform("min")
+        md_max = feat.groupby("well_id")["MD"].transform("max")
+        span = (md_max - md_min).replace(0, 1)
+        feat["md_frac"] = (feat["MD"] - md_min) / span
+
+    # TVT forward/backfill features
+    if "TVT_input" in feat.columns:
+        feat["tvt_ffill"] = feat.groupby("well_id")["TVT_input"].ffill().fillna(0)
+        feat["tvt_bfill"] = feat.groupby("well_id")["TVT_input"].bfill().fillna(0)
+        feat["tvt_known_flag"] = feat["TVT_input"].notna().astype(int)
+        feat["tvt_delta2"] = feat["tvt_lag1"] - feat["tvt_lag2"]
+        feat["tvt_delta5"] = feat["tvt_lag1"] - feat["tvt_lag5"]
+
+    # More GR derived features
+    if "GR" in feat.columns:
+        feat["gr_delta1"] = feat["GR"] - feat["GR_lag1"]
+        feat["gr_delta2"] = feat["GR_lag1"] - feat["GR_lag2"]
+        feat["gr_delta5"] = feat["GR_lag1"] - feat["GR_lag5"]
+        feat["gr_roll_range10"] = feat["gr_roll_mean10"] - feat["gr_roll_mean5"]
+
     # Geological prior features (constant per well, but very powerful)
     if geo_prior:
         for k, v in geo_prior.items():
             if isinstance(v, (int, float)):
                 feat[f"prior_{k}"] = float(v)
 
+    # Add well-level metadata and cluster features
+    feat = _add_well_summary_features(feat)
+    feat = _add_well_cluster_features(feat)
+
     feat = feat.fillna(feat.median(numeric_only=True))
+    return feat
+
+
+def _add_well_summary_features(feat: pd.DataFrame) -> pd.DataFrame:
+    if "well_id" not in feat.columns:
+        return feat
+
+    agg_defs = {
+        "MD": ["min", "max"],
+        "GR": ["mean", "std", "min", "max"],
+        "Z": ["min", "max"],
+        "TVT_input": ["mean", "std"],
+    }
+    summary = feat.groupby("well_id").agg(agg_defs)
+    summary.columns = [f"well_{col}_{fn}" for col, fn in summary.columns]
+    summary = summary.fillna(0)
+
+    summary["well_md_span"] = (summary["well_MD_max"] - summary["well_MD_min"]).replace(0, 1)
+    summary["well_gr_range"] = (summary["well_GR_max"] - summary["well_GR_min"]).fillna(0)
+    summary["well_z_range"] = (summary["well_Z_max"] - summary["well_Z_min"]).fillna(0)
+    summary["well_tvt_known_frac"] = feat.groupby("well_id")["TVT_input"].apply(
+        lambda s: float(s.notna().mean()) if len(s) > 0 else 0.0
+    )
+    summary["well_row_count"] = feat.groupby("well_id")["MD"].size().astype(float)
+
+    summary = summary.reset_index()
+    feat = feat.merge(summary, on="well_id", how="left")
+    return feat
+
+
+def _add_well_cluster_features(feat: pd.DataFrame, n_clusters: int = 4) -> pd.DataFrame:
+    if "well_id" not in feat.columns:
+        return feat
+
+    cluster_features = [
+        "well_GR_mean", "well_GR_std", "well_gr_range",
+        "well_tvt_known_frac", "well_z_range", "well_md_span",
+    ]
+    if not all(col in feat.columns for col in cluster_features):
+        return feat
+
+    well_summary = feat["well_id"].drop_duplicates().to_frame()
+    well_summary = well_summary.merge(
+        feat.groupby("well_id")[cluster_features].first().reset_index(),
+        on="well_id", how="left"
+    ).fillna(0)
+
+    if len(well_summary) < n_clusters:
+        feat["well_cluster_id"] = 0
+        return feat
+
+    try:
+        from sklearn.cluster import KMeans
+        numeric = well_summary[cluster_features].astype(float)
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        well_summary["well_cluster_id"] = kmeans.fit_predict(numeric)
+    except Exception:
+        feat["well_cluster_id"] = 0
+        return feat
+
+    feat = feat.merge(well_summary[["well_id", "well_cluster_id"]], on="well_id", how="left")
+    feat["well_cluster_id"] = feat["well_cluster_id"].fillna(0).astype(int)
     return feat
 
 
@@ -90,7 +183,8 @@ def train_catboost(X_train: pd.DataFrame, y_train: np.ndarray,
     model.fit(
         X_train, y_train,
         eval_set=(X_val, y_val),
-        early_stopping_rounds=50,
+        early_stopping_rounds=100,
+        use_best_model=True,
     )
     return model
 
@@ -118,18 +212,26 @@ def load_catboost(name: str = "catboost_tvt"):
 
 # ─── Transformer TVT Predictor ───────────────────────────────────────────────
 
-class GeoTVTTransformer(nn.Module):
-    """
-    Geological-aware sequence model for TVT prediction.
-    
-    Fuses:
-      1. Drilling telemetry sequence (GR, MD, XYZ, past TVT)
-      2. Typewell context embedding (from TypewellEncoder)
-      3. Geological prior vector (from prior engine)
-    
-    Uses a causal transformer to autoregressively predict TVT values
-    in the NaN zone (the actual competition prediction target).
-    """
+if nn is None:
+    class GeoTVTTransformer:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("PyTorch is required for GeoTVTTransformer")
+
+        def forward(self, *args, **kwargs):
+            raise ImportError("PyTorch is required for GeoTVTTransformer")
+else:
+    class GeoTVTTransformer(nn.Module):
+        """
+        Geological-aware sequence model for TVT prediction.
+        
+        Fuses:
+          1. Drilling telemetry sequence (GR, MD, XYZ, past TVT)
+          2. Typewell context embedding (from TypewellEncoder)
+          3. Geological prior vector (from prior engine)
+        
+        Uses a causal transformer to autoregressively predict TVT values
+        in the NaN zone (the actual competition prediction target).
+        """
 
     def __init__(
         self,
@@ -231,6 +333,8 @@ def autoregressive_predict(
     
     Returns: (predictions [n_steps], uncertainties [n_steps])
     """
+    if torch is None:
+        raise ImportError("PyTorch is required for autoregressive_predict")
     model.eval()
 
     telemetry = torch.tensor(known_telemetry, dtype=torch.float32, device=device)
