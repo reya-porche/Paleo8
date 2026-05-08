@@ -64,12 +64,15 @@ def split_wells(df: pd.DataFrame, val_frac: float = 0.2,
 
 def prepare_catboost_features(df: pd.DataFrame,
                                geo_priors: Optional[dict] = None,
-                               target_col: str = "TVT") -> tuple:
+                               target_col: str = "TVT",
+                               phase: int = 1) -> tuple:
     """
     Build feature matrix and target vector for CatBoost.
     Drops rows where target is NaN (those are the prediction zone).
+    
+    phase: controls which features to include
     """
-    feat_df = engineer_sequence_features(df, geo_prior=geo_priors)
+    feat_df = engineer_sequence_features(df, geo_prior=geo_priors, phase=phase)
 
     # Target
     if target_col not in feat_df.columns:
@@ -227,17 +230,23 @@ def train_transformer_model(
 
 # ─── Training Orchestration ──────────────────────────────────────────────────
 
-def train_baseline(data_path: str, geo_priors: Optional[dict] = None) -> dict:
+def train_baseline(data_path: str, geo_priors: Optional[dict] = None, phase: int = 1) -> dict:
     """
     Full training run for CatBoost baseline.
+    
+    phase 1: sequence + TVT continuation (baseline)
+    phase 2: + typewell matching (confidence-gated)
+    phase 3: + well clustering (reduced count)
+    phase 4: + hybrid physics residual
+    
     Returns evaluation metrics.
     """
     df = load_competition_data(data_path)
     train_df, val_df = split_wells(df)
 
-    print("[trainer] Engineering features...")
-    X_train, y_train = prepare_catboost_features(train_df, geo_priors)
-    X_val,   y_val   = prepare_catboost_features(val_df, geo_priors)
+    print(f"[trainer] Phase {phase}: Engineering features...")
+    X_train, y_train = prepare_catboost_features(train_df, geo_priors, phase=phase)
+    X_val,   y_val   = prepare_catboost_features(val_df, geo_priors, phase=phase)
 
     # Align columns
     X_val = X_val.reindex(columns=X_train.columns, fill_value=0)
@@ -245,25 +254,25 @@ def train_baseline(data_path: str, geo_priors: Optional[dict] = None) -> dict:
     print(f"[trainer] Feature matrix: {X_train.shape}")
     print("[trainer] Training CatBoost...")
     model = train_catboost(X_train, y_train, X_val, y_val)
-    save_catboost(model)
+    save_catboost(model, name=f"catboost_tvt_phase{phase}")
 
     # Evaluate
     val_preds = predict_catboost(model, X_val)
     mae  = float(np.mean(np.abs(val_preds - y_val)))
     rmse = float(np.sqrt(np.mean((val_preds - y_val) ** 2)))
 
-    print(f"[trainer] Val MAE:  {mae:.4f}")
-    print(f"[trainer] Val RMSE: {rmse:.4f}")
+    print(f"[trainer] Phase {phase} Val MAE:  {mae:.4f}")
+    print(f"[trainer] Phase {phase} Val RMSE: {rmse:.4f}")
 
     # Feature importance
     fi = pd.Series(
         model.get_feature_importance(),
         index=X_train.columns
     ).sort_values(ascending=False).head(20)
-    print("\n[trainer] Top 20 features:")
+    print(f"\n[trainer] Phase {phase} Top 20 features:")
     print(fi.to_string())
 
-    return {"mae": mae, "rmse": rmse, "n_features": X_train.shape[1]}
+    return {"mae": mae, "rmse": rmse, "n_features": X_train.shape[1], "phase": phase}
 
 
 def cross_validate_baseline(

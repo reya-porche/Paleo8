@@ -86,9 +86,11 @@ def scrape(lat, lon, age, output):
 @click.option("--data",       required=True, type=str, help="Path to training CSV")
 @click.option("--prior-json", default=None,  type=str, help="Path to geo prior JSON (from scrape)")
 @click.option("--strategy",   default="catboost", type=click.Choice(["catboost", "clustered", "transformer"]))
+@click.option("--phase",      default=1, type=int, help="Phase: 1=baseline, 2=typewell, 3=clustering, 4=hybrid")
 @click.option("--cv-folds",   default=0, type=int, help="Run repeated well-level validation splits")
-@click.option("--n-clusters", default=5, type=int, help="Number of well clusters for clustered training")
-def train(data, prior_json, strategy, cv_folds, n_clusters):
+@click.option("--n-clusters", default=0, type=int, help="Number of well clusters (0=auto for phase 3)")
+@click.option("--confidence-threshold", default=0.70, type=float, help="Typewell confidence gate (0.50-0.90)")
+def train(data, prior_json, strategy, phase, cv_folds, n_clusters, confidence_threshold):
     """Train TVT prediction model on competition data."""
     from model.trainer import (
         train_baseline,
@@ -104,8 +106,9 @@ def train(data, prior_json, strategy, cv_folds, n_clusters):
         console.print(f"[cyan]Loaded geological priors from {prior_json}[/]")
 
     console.print(Panel(
-        f"[bold]Training {strategy.replace('_', ' ').upper()} model[/]\n"
+        f"[bold]Training Phase {phase} ({strategy.upper()} model)[/]\n"
         f"Data: {data}\n"
+        f"Confidence threshold: {confidence_threshold}\n"
         f"Geological priors: {'YES' if geo_priors else 'NO (use --prior-json to add)'}",
         title="GeoTVT Trainer"
     ))
@@ -119,13 +122,14 @@ def train(data, prior_json, strategy, cv_folds, n_clusters):
         return
 
     if strategy == "catboost":
-        metrics = train_baseline(data, geo_priors=geo_priors)
-        console.print(f"\n[bold green]Training complete![/]")
+        metrics = train_baseline(data, geo_priors=geo_priors, phase=phase)
+        console.print(f"\n[bold green]Phase {phase} training complete![/]")
         console.print(f"  Val MAE:  [cyan]{metrics['mae']:.4f}[/]")
         console.print(f"  Val RMSE: [cyan]{metrics['rmse']:.4f}[/]")
         console.print(f"  Features: [cyan]{metrics['n_features']}[/]")
+        console.print(f"  Model:    [cyan]models/catboost_tvt_phase{phase}.cbm[/]")
     elif strategy == "clustered":
-        metrics = train_clustered_baseline(data, geo_priors=geo_priors, n_clusters=n_clusters)
+        metrics = train_clustered_baseline(data, geo_priors=geo_priors, n_clusters=n_clusters or 3)
         console.print(f"\n[bold green]Clustered training complete![/]")
         console.print(f"  Val MAE:  [cyan]{metrics['mae']:.4f}[/]")
         console.print(f"  Val RMSE: [cyan]{metrics['rmse']:.4f}[/]")

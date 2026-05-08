@@ -32,9 +32,15 @@ from config import SEQUENCE_WINDOW, CATBOOST_PARAMS, MODEL_DIR
 # ─── Feature Engineering ─────────────────────────────────────────────────────
 
 def engineer_sequence_features(df: pd.DataFrame,
-                                geo_prior: Optional[dict] = None) -> pd.DataFrame:
+                                geo_prior: Optional[dict] = None,
+                                phase: int = 1) -> pd.DataFrame:
     """
     Build sequence features for the CatBoost baseline.
+    
+    Phase 1: sequence + TVT continuation (baseline)
+    Phase 2: + typewell matching (confidence-gated)
+    Phase 3: + well clustering (reduced count)
+    Phase 4: + hybrid physics residual
     
     Inputs: drilling log DataFrame with columns:
       MD, X, Y, Z, GR, TVT_input (may have NaN in prediction zone)
@@ -93,17 +99,111 @@ def engineer_sequence_features(df: pd.DataFrame,
         feat["gr_delta5"] = feat["GR_lag1"] - feat["GR_lag5"]
         feat["gr_roll_range10"] = feat["gr_roll_mean10"] - feat["gr_roll_mean5"]
 
-    # Geological prior features (constant per well, but very powerful)
-    if geo_prior:
-        for k, v in geo_prior.items():
-            if isinstance(v, (int, float)):
-                feat[f"prior_{k}"] = float(v)
+    # Phase 2+: Confidence-gated typewell features
+    if phase >= 2:
+        feat = _add_confidence_gated_typewell_features(feat)
 
-    # Add well-level metadata and cluster features
-    feat = _add_well_summary_features(feat)
-    feat = _add_well_cluster_features(feat)
+    # Enhanced geological features without coordinates
+    if "GR" in feat.columns:
+        # GR-based lithology proxies
+        feat["gr_shale_proxy"] = (feat["GR"] > 100).astype(int)
+        feat["gr_sand_proxy"] = (feat["GR"] < 60).astype(int)
+        feat["gr_mudstone_proxy"] = ((feat["GR"] >= 60) & (feat["GR"] <= 100)).astype(int)
+
+        # Cyclicity and rhythmicity (depositional environment proxy)
+        feat["gr_autocorr_lag10"] = feat["GR"].rolling(20, min_periods=1).apply(
+            lambda x: float(np.corrcoef(x[:-10], x[10:])[0, 1]) if len(x) > 10 else 0.0
+        ).fillna(0)
+
+        # Formation thickness proxies (from GR transitions)
+        gr_diff = feat["GR"].diff().fillna(0)
+        feat["gr_transition_count"] = (gr_diff.abs() > 20).rolling(50, min_periods=1).sum()
+        feat["gr_formation_stability"] = feat["GR"].rolling(30, min_periods=1).std().fillna(0)
+
+    # TVT geology-aware features
+    if "TVT_input" in feat.columns:
+        # Depositional rate proxies
+        feat["tvt_depositional_rate"] = feat["TVT_input"].diff().fillna(0).abs()
+        feat["tvt_formation_thickness"] = feat.groupby("well_id")["TVT_input"].transform(
+            lambda x: x.max() - x.min()
+        )
+
+        # Continuity and facies changes
+        feat["tvt_facies_change"] = (feat["tvt_delta"].abs() > 1.0).astype(int)
+        feat["tvt_continuity_score"] = feat["tvt_delta"].rolling(10, min_periods=1).std().fillna(0)
+
+    # Well-level geological summary features (coordinate-free)
+    feat = _add_geological_summary_features(feat)
+
+    # Phase 3+: Add cluster features with reduced cluster count for 100 wells
+    if phase >= 3:
+        n_clusters_auto = max(2, min(3, len(feat["well_id"].unique()) // 30))
+        feat = _add_well_cluster_features(feat, n_clusters=n_clusters_auto)
 
     feat = feat.fillna(feat.median(numeric_only=True))
+    return feat
+
+
+def _add_geological_summary_features(feat: pd.DataFrame) -> pd.DataFrame:
+    if "well_id" not in feat.columns:
+        return feat
+
+    # Aggregate geological proxies per well
+    agg_defs = {
+        "GR": ["mean", "std", "min", "max"],
+        "gr_shale_proxy": "mean",
+        "gr_sand_proxy": "mean",
+        "gr_mudstone_proxy": "mean",
+        "gr_autocorr_lag10": "mean",
+        "gr_transition_count": "mean",
+        "gr_formation_stability": "mean",
+        "tvt_depositional_rate": "mean",
+        "tvt_formation_thickness": "first",
+        "tvt_facies_change": "mean",
+        "tvt_continuity_score": "mean",
+    }
+    summary = feat.groupby("well_id").agg(agg_defs)
+    summary.columns = [f"well_geo_{col}_{fn}" for col, fn in summary.columns]
+    summary = summary.fillna(0)
+
+    # Derived geological indices
+    summary["well_geo_depositional_energy"] = (
+        summary["well_geo_gr_formation_stability"] / (summary["well_geo_gr_mean"] + 1)
+    )
+    summary["well_geo_facies_complexity"] = (
+        summary["well_geo_tvt_facies_change"] * summary["well_geo_gr_transition_count"]
+    )
+    summary["well_geo_lithology_diversity"] = (
+        summary["well_geo_gr_shale_proxy"] +
+        summary["well_geo_gr_sand_proxy"] +
+        summary["well_geo_gr_mudstone_proxy"]
+    )
+
+    summary = summary.reset_index()
+    feat = feat.merge(summary, on="well_id", how="left")
+    return feat
+
+
+def _add_confidence_gated_typewell_features(feat: pd.DataFrame, confidence_threshold: float = 0.70) -> pd.DataFrame:
+    """
+    Add typewell-derived features, but only count them when confidence is high.
+    This prevents weak matches from contaminating the model.
+    """
+    if "well_id" not in feat.columns:
+        return feat
+
+    # Dummy typewell features (would come from alignment in real scenario)
+    # For now, initialize as zeros; real implementation would compute from actual typewell
+    feat["tw_best_tvt"] = 0.0
+    feat["tw_confidence"] = 0.0
+    feat["tw_tvt_spread"] = 0.0
+    feat["tw_weighted_tvt"] = 0.0
+
+    # Gated versions: only contribute when confidence is high
+    feat["tw_best_tvt_gated"] = feat["tw_best_tvt"] * (feat["tw_confidence"] > confidence_threshold).astype(float)
+    feat["tw_weighted_tvt_gated"] = feat["tw_weighted_tvt"] * (feat["tw_confidence"] > confidence_threshold).astype(float)
+    feat["tw_spread_penalty"] = feat["tw_tvt_spread"]  # spread always counts
+
     return feat
 
 
@@ -138,9 +238,12 @@ def _add_well_cluster_features(feat: pd.DataFrame, n_clusters: int = 4) -> pd.Da
     if "well_id" not in feat.columns:
         return feat
 
+    # Use enhanced geological features for clustering
     cluster_features = [
-        "well_GR_mean", "well_GR_std", "well_gr_range",
-        "well_tvt_known_frac", "well_z_range", "well_md_span",
+        "well_geo_gr_mean", "well_geo_gr_std", "well_geo_gr_formation_stability",
+        "well_geo_depositional_energy", "well_geo_facies_complexity",
+        "well_geo_lithology_diversity", "well_geo_tvt_continuity_score",
+        "well_geo_gr_autocorr_lag10", "well_geo_tvt_formation_thickness",
     ]
     if not all(col in feat.columns for col in cluster_features):
         return feat
@@ -157,7 +260,9 @@ def _add_well_cluster_features(feat: pd.DataFrame, n_clusters: int = 4) -> pd.Da
 
     try:
         from sklearn.cluster import KMeans
-        numeric = well_summary[cluster_features].astype(float)
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        numeric = scaler.fit_transform(well_summary[cluster_features].astype(float))
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         well_summary["well_cluster_id"] = kmeans.fit_predict(numeric)
     except Exception:

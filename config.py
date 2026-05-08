@@ -1,7 +1,14 @@
 """
 geo_tvt/config.py
-Central configuration for API keys, endpoints, and system settings.
-Set ANTHROPIC_API_KEY in your environment before running.
+Central configuration for system settings.
+
+FOR KAGGLE TRAINING: No external API keys needed!
+  - All training uses only the training CSV
+  - External APIs (Macrostrat, USGS, GPlates, NOAA) are public and optional
+  - ANTHROPIC_API_KEY is only needed for the --ontology CLI command
+
+Training command:
+  python main.py train --data train.csv --strategy clustered
 """
 
 import os
@@ -18,9 +25,10 @@ DATA_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
 # ─── API Keys ─────────────────────────────────────────────────────────────────
+# OPTIONAL: Only needed for --ontology CLI command (not for training)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# ─── External API Endpoints ───────────────────────────────────────────────────
+# ─── External API Endpoints (all public, no auth required) ──────────────────────
 MACROSTRAT_BASE   = "https://macrostrat.org/api/v2"
 USGS_BASE         = "https://mrdata.usgs.gov/api/v1"
 GPLATES_BASE      = "https://gws.gplates.org"

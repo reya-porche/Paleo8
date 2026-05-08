@@ -11,7 +11,10 @@ vocabulary, enabling consistent model features across all data sources.
 """
 
 import json
-import anthropic
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
 from pathlib import Path
 from typing import Optional
 import sys
@@ -20,12 +23,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import ANTHROPIC_API_KEY, DEPOSITIONAL_ENVIRONMENTS
 from cache.storage import cache_get, cache_set
 
-_client: Optional[anthropic.Anthropic] = None
+_client: Optional[object] = None
 
 
-def _get_client() -> anthropic.Anthropic:
+def _get_client():
     global _client
     if _client is None:
+        if anthropic is None:
+            raise ImportError(
+                "anthropic package is required for ontology mapping. "
+                "Install with: pip install anthropic"
+            )
         _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     return _client
 
