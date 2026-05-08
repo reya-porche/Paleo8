@@ -143,7 +143,8 @@ def run(train, test, typewell, target, tvt_input, gr, md, x, y, z,
     phase1_cols = (
         groups["baseline"] + groups["gr_rolling"] + groups["gr_derivatives"] +
         groups["gr_lags"] + groups["gr_proxies"] + groups["trajectory"] +
-        groups["tvt_continuation"] + groups["tvt_history"]
+        groups["tvt_continuation"] + groups["tvt_history"] +
+        groups.get("anchor_stats", [])
     )
     phase1_cols = list(dict.fromkeys(c for c in phase1_cols if c in train_feat.columns))
     active_features = phase1_cols.copy()
@@ -308,13 +309,17 @@ def _quick_eval(
 
     try:
         from catboost import CatBoostRegressor
-        model = CatBoostRegressor(iterations=300, learning_rate=0.05, depth=7,
-                                  verbose=0, random_seed=42, loss_function="MAE")
+        model = CatBoostRegressor(iterations=800, learning_rate=0.05, depth=7,
+                                  verbose=0, random_seed=42, loss_function="MAE",
+                                  early_stopping_rounds=50, use_best_model=True)
     except ImportError:
         from sklearn.ensemble import HistGradientBoostingRegressor
-        model = HistGradientBoostingRegressor(max_iter=200, max_depth=7, random_state=42)
+        model = HistGradientBoostingRegressor(max_iter=400, max_depth=7, random_state=42)
 
-    model.fit(X_tr, y_tr)
+    try:
+        model.fit(X_tr, y_tr, eval_set=(X_vl, y_vl))
+    except TypeError:
+        model.fit(X_tr, y_tr)
     preds = model.predict(X_vl)
     return float(np.mean(np.abs(y_vl - preds)))
 
@@ -336,11 +341,12 @@ def _finalize(
 
     try:
         from catboost import CatBoostRegressor
-        model = CatBoostRegressor(iterations=1000, learning_rate=0.03, depth=8,
-                                  verbose=200, random_seed=42, loss_function="MAE")
+        model = CatBoostRegressor(iterations=2000, learning_rate=0.03, depth=8,
+                                  verbose=200, random_seed=42, loss_function="MAE",
+                                  l2_leaf_reg=3)
     except ImportError:
         from sklearn.ensemble import HistGradientBoostingRegressor
-        model = HistGradientBoostingRegressor(max_iter=500, max_depth=8, random_state=42)
+        model = HistGradientBoostingRegressor(max_iter=800, max_depth=8, random_state=42)
 
     model.fit(X_all, y_all)
     console.print(f"  [green]Final model trained on {len(y_all):,} samples, {len(avail)} features[/]")

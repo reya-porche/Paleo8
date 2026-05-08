@@ -64,6 +64,9 @@ def build_all_sequence_features(
     # ── Trajectory features ───────────────────────────────────────────────────
     if md_col in feat.columns:
         feat["md_step"] = feat[md_col].diff().fillna(feat[md_col].diff().median())
+        md_min = feat[md_col].min()
+        md_max = feat[md_col].max()
+        feat["md_frac"] = (feat[md_col] - md_min) / max(1.0, md_max - md_min)
 
     if x_col in feat.columns and y_col in feat.columns:
         x, y = feat[x_col], feat[y_col]
@@ -102,6 +105,14 @@ def build_all_sequence_features(
         for window in [5, 10, 20, 50, 100, 200]:
             feat[f"tvt_pre_slope_{window}"] = _pre_nan_slope(tvt, window)
 
+        # Linear extrapolation: last_known + slope × distance_into_NaN_zone
+        # This gives the model a direct "free answer" for linear continuation.
+        dist = feat["dist_from_last_known"]
+        for window in [5, 10, 20, 50]:
+            feat[f"tvt_extrap_{window}"] = (
+                feat["last_known_tvt"] + feat[f"tvt_pre_slope_{window}"] * dist
+            )
+
         for w in [5, 10, 20, 50]:
             feat[f"tvt_rmean_{w}"]  = tvt_ffill.rolling(w, min_periods=1).mean()
             feat[f"tvt_rstd_{w}"]   = tvt_ffill.rolling(w, min_periods=1).std().fillna(0)
@@ -109,8 +120,39 @@ def build_all_sequence_features(
         for lag in [1, 2, 3, 5, 10, 20]:
             feat[f"tvt_lag{lag}"] = tvt_ffill.shift(lag)
 
+        # Anchor-zone statistics — well-level constants, critical for cross-well generalization
+        anchor_mask = tvt.notna()
+        anchor_tvt = tvt[anchor_mask]
+        nan_count = float(tvt.isna().sum())
+        anchor_count = float(anchor_mask.sum())
+
+        if len(anchor_tvt) >= 2:
+            x_anc = np.arange(len(anchor_tvt), dtype=float)
+            anchor_global_slope = float(np.polyfit(x_anc, anchor_tvt.values, 1)[0])
+        else:
+            anchor_global_slope = 0.0
+
+        feat["anchor_tvt_mean"]   = float(anchor_tvt.mean())   if len(anchor_tvt) > 0 else 0.0
+        feat["anchor_tvt_last"]   = float(anchor_tvt.iloc[-1]) if len(anchor_tvt) > 0 else 0.0
+        feat["anchor_tvt_range"]  = float(anchor_tvt.max() - anchor_tvt.min()) if len(anchor_tvt) > 1 else 0.0
+        feat["anchor_global_slope"] = anchor_global_slope
+        feat["anchor_length"]     = anchor_count
+        feat["nan_length"]        = nan_count
+        feat["tvt_known_frac"]    = anchor_count / max(1.0, anchor_count + nan_count)
+        feat["nan_to_anchor_ratio"] = nan_count / max(1.0, anchor_count)
+
+        # GR context at the anchor-NaN boundary
         if gr_col in feat.columns:
+            nan_start = int(tvt.isna().values.argmax()) if tvt.isna().any() else len(tvt)
+            if nan_start > 0:
+                boundary_gr = gr.iloc[max(0, nan_start - 20):nan_start]
+                feat["gr_at_boundary"]     = float(boundary_gr.mean())
+                feat["gr_std_at_boundary"] = float(boundary_gr.std()) if len(boundary_gr) > 1 else 0.0
+            else:
+                feat["gr_at_boundary"]     = float(gr.mean())
+                feat["gr_std_at_boundary"] = float(gr.std()) if len(gr) > 1 else 0.0
             feat["gr_vs_pre_nan"] = gr - _pre_nan_mean(gr, tvt)
+
         if z_col in feat.columns:
             feat["z_vs_pre_nan"] = feat[z_col] - _pre_nan_mean(feat[z_col], tvt)
 
@@ -175,17 +217,24 @@ def get_feature_groups(df: pd.DataFrame) -> dict:
     """Return named column groups for ablation. Call after feature building."""
     c = list(df.columns)
     return {
-        "baseline":         ["GR", "MD", "X", "Y", "Z", "TVT_input"],
+        # TVT_input excluded from baseline — it becomes 0 in the NaN zone (misleading).
+        # Use tvt_ffill (last-known carry-forward) instead.
+        "baseline":         ["GR", "MD", "X", "Y", "Z"],
         "gr_rolling":       [x for x in c if x.startswith("gr_r")],
         "gr_derivatives":   [x for x in c if x.startswith("gr_d") or "gr_grad" in x],
         "gr_lags":          [x for x in c if "gr_lag" in x or "gr_lead" in x],
         "gr_proxies":       [x for x in c if "proxy" in x],
         "trajectory":       [x for x in c if any(k in x for k in
                               ["horiz", "x_d1", "y_d1", "z_d1", "z_d2", "z_curve",
-                               "z_rm", "z_dev", "md_step"])],
-        "tvt_continuation": [x for x in c if "pre_slope" in x or x in
-                              ["last_known_tvt", "dist_from_last_known",
-                               "tvt_ffill", "in_nan_zone", "gr_vs_pre_nan", "z_vs_pre_nan"]],
+                               "z_rm", "z_dev", "md_step", "md_frac"])],
+        "tvt_continuation": [x for x in c if "pre_slope" in x or "tvt_extrap" in x or x in
+                              ["last_known_tvt", "dist_from_last_known", "tvt_ffill",
+                               "in_nan_zone", "gr_vs_pre_nan", "z_vs_pre_nan"]],
         "tvt_history":      [x for x in c if x.startswith("tvt_r") or x.startswith("tvt_lag")
                               or x in ["tvt_d1", "tvt_d2"]],
+        "anchor_stats":     [x for x in c if x in [
+                              "anchor_tvt_mean", "anchor_tvt_last", "anchor_tvt_range",
+                              "anchor_global_slope", "anchor_length", "nan_length",
+                              "tvt_known_frac", "nan_to_anchor_ratio",
+                              "gr_at_boundary", "gr_std_at_boundary"]],
     }
